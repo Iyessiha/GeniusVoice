@@ -1,0 +1,182 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..800;1,14..32,400&display=swap");
+@import "tailwindcss";
+
+/* ── Jetons de thème ──────────────────────────────────────────────────
+ * Un seul système : bleu profond pour l'autorité (on vend à des hôpitaux
+ * et des cabinets), vert d'eau pour l'état « en ligne » de l'agent.
+ */
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+
+  --color-ink-900: #0a1628;
+  --color-ink-700: #1e3356;
+  --color-ink-500: #4a6285;
+  --color-ink-300: #8fa3bf;
+
+  --color-brand-50: #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-brand-200: #bfdbfe;
+  --color-brand-400: #60a5fa;
+  --color-brand-500: #3b82f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1e4db7;
+  --color-brand-900: #0f2547;
+
+  --color-live-400: #34d399;
+  --color-live-600: #059669;
+
+  --color-surface: #ffffff;
+  --color-raised: #f8faff;
+  --color-page: #f0f4ff;
+  --color-hairline: rgb(30 77 183 / 0.14);
+
+  --radius-card: 14px;
+}
+
+:root {
+  --bg: var(--color-page);
+  --fg: var(--color-ink-900);
+  --card: var(--color-surface);
+  --muted: var(--color-ink-500);
+  --line: var(--color-hairline);
+}
+
+/* Le tableau de bord est consulté tôt le matin et tard le soir dans des
+ * cabinets peu éclairés : le thème sombre n'est pas cosmétique. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #080e1a;
+    --fg: #e8eefc;
+    --card: #0f1829;
+    --muted: #8fa3bf;
+    --line: rgb(143 163 191 / 0.18);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #080e1a;
+  --fg: #e8eefc;
+  --card: #0f1829;
+  --muted: #8fa3bf;
+  --line: rgb(143 163 191 / 0.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+/* ── Primitives réutilisées partout ──────────────────────────────── */
+
+@utility card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+}
+
+@utility muted {
+  color: var(--muted);
+}
+
+@utility field {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  background: var(--card);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  outline: none;
+}
+.field:focus {
+  border-color: var(--color-brand-500);
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 0.18);
+}
+
+@utility btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-weight: 600;
+  transition: filter 0.15s ease, opacity 0.15s ease;
+}
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.btn:not(:disabled):hover {
+  filter: brightness(1.07);
+}
+
+@utility btn-primary {
+  background: var(--color-brand-700);
+  color: #fff;
+}
+
+@utility btn-ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--fg);
+}
+
+@utility btn-danger {
+  background: #dc2626;
+  color: #fff;
+}
+
+/* ── Pulsation de l'agent en ligne ───────────────────────────────── */
+
+@keyframes gv-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+.gv-pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: gv-pulse 1.8s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gv-pulse::after {
+    animation: none;
+  }
+}
