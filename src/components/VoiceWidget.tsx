@@ -58,7 +58,7 @@ export default function VoiceWidget({
   const voice = useRealtimeVoice({
     publicKey,
     apiBase,
-    onEnded: (reason) => setEndedReason(reason),
+    onEnded: setEndedReason,
   });
 
   const { status, isLive, error, transcript, remainingSeconds, agentName, muted, connect, disconnect, toggleMute } =
@@ -132,7 +132,7 @@ export default function VoiceWidget({
     );
   }
 
-  const canTalk = available && status !== "error";
+  const canTalk = available;
 
   return (
     <div
@@ -186,7 +186,7 @@ export default function VoiceWidget({
         {embedded && (
           <button
             onClick={() => {
-              if (isLive) disconnect();
+              disconnect();
               setOpen(false);
             }}
             aria-label="Fermer"
@@ -290,15 +290,20 @@ export default function VoiceWidget({
         }}
       >
         {!isLive ? (
-          <button
-            onClick={start}
-            disabled={busy || !canTalk}
-            className="btn btn-primary"
-            style={{ flex: 1, background: brandColor }}
-          >
-            {busy ? <Loader2 size={16} className="animate-spin" /> : <Mic size={16} />}
-            {busy ? "Connexion…" : status === "ended" || status === "error" ? "Rappeler" : "Démarrer l'appel"}
-          </button>
+          <>
+            <button
+              onClick={start}
+              disabled={busy || !canTalk}
+              className="btn btn-primary"
+              style={{ flex: 1, background: brandColor }}
+            >
+              {busy ? <Loader2 size={16} className="animate-spin" /> : <Mic size={16} />}
+              {busy ? "Connexion…" : status === "ended" || status === "error" ? "Rappeler" : "Démarrer l'appel"}
+            </button>
+            {busy && (
+              <button className="btn btn-ghost" onClick={disconnect}>Annuler</button>
+            )}
+          </>
         ) : (
           <>
             <button onClick={toggleMute} className="btn btn-ghost" aria-pressed={muted} style={{ flexShrink: 0 }}>

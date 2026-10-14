@@ -11,9 +11,9 @@ export function OPTIONS(req: Request) {
  *
  *  Le widget appelle cette route toutes les 15 secondes puis une dernière
  *  fois avec `finalize`. Aucune durée n'est acceptée du client : le serveur
- *  la recalcule depuis `started_at`. Un onglet fermé brutalement laisse donc
- *  au plus 15 secondes non débitées, et jamais une conversation facturée
- *  deux fois.
+ *  la recalcule depuis `started_at`. Après clôture, la durée ne change plus.
+ *  Une fermeture brutale reste best-effort : la supervision des sessions
+ *  abandonnées doit être implémentée indépendamment du navigateur.
  */
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
