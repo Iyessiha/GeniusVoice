@@ -24,8 +24,10 @@ conventions de données sont transposables entre les deux produits.
 
 ## Installation
 
+Node 22 récent recommandé (au minimum 22.12 pour les outils de test).
+
 ```bash
-npm install
+npm ci
 cp .env.example .env.local     # puis renseigner les variables
 ```
 
@@ -49,6 +51,7 @@ index.
 npm run dev          # http://localhost:3000
 npm run typecheck
 npm run lint
+npm test             # tests voix / widget / compteur (prestataires et DB simulés)
 npm run build
 ```
 
@@ -95,10 +98,14 @@ un visiteur qui bidouille la console ne peut ni forger un rendez-vous, ni lire
 les données d'un autre tenant, ni appeler un outil décoché.
 (`src/app/api/realtime/tool/route.ts`, `src/lib/tools.ts`)
 
-**La facturation ne croit pas le navigateur.** La durée est recalculée à chaque
-relève depuis `conversations.started_at`. Un onglet fermé brutalement laisse au
-plus 15 secondes non débitées ; une relève rejouée ne débite pas deux fois.
-(`src/lib/minutes.ts`)
+**Le compteur clôturé est terminal.** La durée est recalculée côté serveur
+à partir de `conversations.started_at` tant que la conversation est active.
+Après clôture, une relève tardive ne débite plus rien et ne modifie pas la fin.
+Le micro est demandé avant de créer la session. Les relèves restent déclenchées
+par le navigateur : clôture `keepalive` best-effort, aucune garantie de rattrapage
+après fermeture brutale. La supervision indépendante du flux OpenAI, la
+réservation atomique de budget et les sessions abandonnées restent à traiter.
+(`src/lib/minutes.ts`, audit A04)
 
 **Les minutes ne sont créditées que par le webhook vérifié.** Le checkout écrit
 une ligne `payments` *avant* la redirection. Le webhook vérifie la signature,
@@ -186,8 +193,19 @@ Chaque outil est activable par agent. Un outil décoché ne s'exécute pas.
   Redis dès qu'il y a plusieurs régions.
 - **Rappels et relances absents.** Aucun cron ne rappelle un rendez-vous ni ne
   relance un prospect.
-- **Pas de tests automatisés.** Le typecheck, le lint et le build passent ;
-  rien n'est couvert par des tests.
+- **Tests partiels.** `npm test` couvre le cycle de vie vocal, les commandes et
+  réglages du widget, le compteur terminal et le crédit transactionnel. Réseau,
+  WebRTC et DB sont simulés : tests d'intégration Postgres, prestataires réels,
+  multi-navigateur et pipeline CI restent à ajouter.
+
+## Audit et suivi des corrections
+
+- [Audit initial du 14/10/2026](docs/AUDIT-2026-10-14.md)
+- [Suivi d'implémentation](docs/IMPLEMENTATION-STATUS.md)
+
+Les correctifs actuels ne rendent pas encore le SaaS prêt à une ouverture
+publique : protection de l'iframe, supervision des coûts, réservations et
+mises à jour de sécurité restent prioritaires.
 
 ---
 

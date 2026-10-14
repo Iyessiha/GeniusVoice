@@ -22,9 +22,9 @@ export default function WidgetClient({ initial }: { initial: Payload }) {
   const [data, setData] = useState<Payload | null>(initial);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useFlash();
-  const [domains, setDomains] = useState<string[]>([]);
+  const [domains, setDomains] = useState<string[]>(initial.business.allowedDomains);
   const [newDomain, setNewDomain] = useState("");
-  const [color, setColor] = useState("#1e4db7");
+  const [color, setColor] = useState(initial.business.brandColor);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);

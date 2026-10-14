@@ -11,13 +11,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * La clé OpenAI ne touche jamais le navigateur.
  *
  * Les outils ne s'exécutent pas ici : le modèle demande, on relaie à
- * /api/realtime/tool, le serveur décide. Un visiteur qui bidouille la
- * console ne peut donc rien écrire en base.
+ * /api/realtime/tool, le serveur vérifie les outils autorisés. Les appels
+ * client restent non fiables : leurs arguments doivent être validés serveur.
  * ──────────────────────────────────────────────────────────────────── */
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 const DATA_CHANNEL = "oai-events";
 const VISITOR_KEY = "gv_visitor";
+const CONNECT_TIMEOUT_MS = 45_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_HEARTBEAT_FAILURES = 3;
+
+type VoiceAttempt = {
+  controller: AbortController;
+  connectTimeout: ReturnType<typeof setTimeout> | null;
+  maxDurationTimeout: ReturnType<typeof setTimeout> | null;
+};
 
 export type VoiceStatus =
   | "idle"
@@ -86,21 +95,38 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /** Évite qu'un double événement rejoue deux fois le même appel d'outil. */
   const handledCallsRef = useRef<Set<string>>(new Set());
-  /** Garde contre une fermeture concurrente (bouton + solde épuisé). */
-  const closingRef = useRef(false);
+  // Une tentative existe dès le premier clic, pas seulement après création
+  // du peer connection. Son identité invalide tous les retours asynchrones.
+  const attemptRef = useRef<VoiceAttempt | null>(null);
+  const mountedRef = useRef(false);
+  const callbacksRef = useRef({ onEnded, onError });
+  useEffect(() => {
+    callbacksRef.current = { onEnded, onError };
+  }, [onEnded, onError]);
 
   const api = useCallback((path: string) => `${apiBase.replace(/\/$/, "")}${path}`, [apiBase]);
 
   const post = useCallback(
-    async (path: string, body: Record<string, unknown>) => {
-      const res = await fetch(api(path), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-      if (!res.ok) throw new Error((json.error as string) || `HTTP ${res.status}`);
-      return json;
+    async (path: string, body: Record<string, unknown>, signal?: AbortSignal) => {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal?.aborted) abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      const timeout = setTimeout(abort, REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch(api(path), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!res.ok) throw new Error((json.error as string) || `HTTP ${res.status}`);
+        return json;
+      } finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
+      }
     },
     [api]
   );
@@ -132,74 +158,72 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
 
   /* ─────────────────────────── Fermeture ─────────────────────────── */
 
+  const finalizeSession = useCallback((session: SessionPayload) => {
+    // Best-effort seulement : une clôture navigateur ne remplace pas un
+    // watchdog serveur pour les sessions abandonnées (audit A04).
+    void fetch(api("/api/realtime/heartbeat"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ publicKey, conversationId: session.conversationId, finalize: true }),
+      keepalive: true,
+    }).catch(() => {});
+  }, [api, publicKey]);
+
   const teardown = useCallback(
     (reason: string | null, nextStatus: VoiceStatus) => {
-      if (closingRef.current) return;
-      closingRef.current = true;
-
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-      }
+      const attempt = attemptRef.current;
+      if (!attempt) return;
+      // Invalider AVANT de fermer : close/abort peuvent produire des événements.
+      attemptRef.current = null;
+      attempt.controller.abort();
+      if (attempt.connectTimeout) clearTimeout(attempt.connectTimeout);
+      if (attempt.maxDurationTimeout) clearTimeout(attempt.maxDurationTimeout);
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
 
       const session = sessionRef.current;
-      if (session) {
-        // Clôture comptable. keepalive permet au débit final de partir même
-        // si l'onglet se ferme dans la seconde.
-        const payload = JSON.stringify({
-          publicKey,
-          conversationId: session.conversationId,
-          finalize: true,
-        });
-        try {
-          void fetch(api("/api/realtime/heartbeat"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-            keepalive: true,
-          }).catch(() => {});
-        } catch {
-          /* rien à faire : le serveur rattrapera via started_at */
-        }
-      }
+      sessionRef.current = null;
+      if (session) finalizeSession(session);
 
-      try {
-        dcRef.current?.close();
-      } catch {}
-      try {
-        pcRef.current?.close();
-      } catch {}
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      const dc = dcRef.current;
+      const pc = pcRef.current;
+      dcRef.current = null;
+      pcRef.current = null;
+      if (dc) {
+        dc.onopen = dc.onclose = dc.onerror = dc.onmessage = null;
+        try { dc.close(); } catch {}
+      }
+      if (pc) {
+        pc.ontrack = pc.onconnectionstatechange = null;
+        try { pc.close(); } catch {}
+      }
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
       if (audioRef.current) {
         audioRef.current.srcObject = null;
         audioRef.current.remove();
+        audioRef.current = null;
       }
-
-      dcRef.current = null;
-      pcRef.current = null;
-      streamRef.current = null;
-      audioRef.current = null;
-      sessionRef.current = null;
       handledCallsRef.current.clear();
-
-      setStatus(nextStatus);
-      onEnded?.(reason);
-      closingRef.current = false;
+      if (mountedRef.current) {
+        setMuted(false);
+        setStatus(nextStatus);
+        callbacksRef.current.onEnded?.(reason);
+      }
     },
-    [api, onEnded, publicKey]
+    [finalizeSession]
   );
 
-  const disconnect = useCallback(() => {
-    teardown(null, "ended");
-  }, [teardown]);
+  const disconnect = useCallback(() => teardown(null, "ended"), [teardown]);
 
   const failWith = useCallback(
     (message: string) => {
+      if (!attemptRef.current || !mountedRef.current) return;
       setError(message);
-      onError?.(message);
       teardown("error", "error");
+      callbacksRef.current.onError?.(message);
     },
-    [onError, teardown]
+    [teardown]
   );
 
   /* ──────────────────────── Appels d'outils ──────────────────────── */
@@ -210,7 +234,8 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
       handledCallsRef.current.add(callId);
 
       const session = sessionRef.current;
-      if (!session) return;
+      const attempt = attemptRef.current;
+      if (!session || !attempt) return;
 
       let output: string;
       try {
@@ -219,7 +244,7 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
           conversationId: session.conversationId,
           name,
           arguments: rawArgs,
-        });
+        }, attempt.controller.signal);
         output = JSON.stringify(json.result ?? {});
       } catch (e) {
         // On rend l'échec au modèle plutôt que de le laisser attendre :
@@ -230,6 +255,7 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
         });
       }
 
+      if (attemptRef.current !== attempt || sessionRef.current !== session) return;
       send({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output } });
       send({ type: "response.create" });
     },
@@ -292,127 +318,152 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
       if (type === "error") {
         const err = evt.error as { message?: string } | undefined;
         console.error("[realtime] erreur serveur :", err?.message ?? evt);
+        failWith("Le service vocal a rencontré une erreur. Vous pouvez rappeler.");
       }
     },
-    [pushLine, runToolCall]
+    [failWith, pushLine, runToolCall]
   );
 
   /* ──────────────────────────── Connexion ──────────────────────────── */
 
   const connect = useCallback(async () => {
-    if (pcRef.current) return;
+    if (attemptRef.current || !mountedRef.current) return;
+    const attempt: VoiceAttempt = {
+      controller: new AbortController(), connectTimeout: null, maxDurationTimeout: null,
+    };
+    attemptRef.current = attempt;
+    const isCurrent = () => mountedRef.current && attemptRef.current === attempt;
+    attempt.connectTimeout = setTimeout(() => {
+      if (isCurrent()) failWith("La connexion prend trop de temps. Vous pouvez rappeler.");
+    }, CONNECT_TIMEOUT_MS);
     setError(null);
     setTranscript([]);
+    setRemainingSeconds(null);
+    setAgentName(null);
+    setMuted(false);
 
-    let session: SessionPayload;
     try {
-      setStatus("connecting");
-      const json = (await post("/api/realtime/session", {
-        publicKey,
-        agentId,
-        visitorRef: visitorRef(),
-      })) as unknown as SessionPayload;
-      session = json;
-      sessionRef.current = json;
-      setAgentName(json.agent?.name ?? null);
-    } catch (e) {
-      failWith((e as Error)?.message || "Service vocal indisponible.");
-      return;
-    }
-
-    let stream: MediaStream;
-    try {
+      // Demander le micro AVANT de créer une conversation facturable.
+      // getUserMedia n'est pas annulable : stopper un éventuel retour tardif.
       setStatus("requesting_mic");
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch {
+        if (isCurrent()) failWith("Micro refusé. Autorisez le microphone pour parler à l'agent.");
+        return;
+      }
+      if (!isCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
-    } catch {
-      failWith("Micro refusé. Autorisez le microphone pour parler à l'agent.");
-      return;
-    }
-
-    try {
       setStatus("connecting");
+
+      // Ne pas annuler le minting au clic Annuler : récupérer sa réponse
+      // permet de clôturer la conversation éventuellement créée serveur.
+      // Un timeout/perte réseau peut toujours laisser un orphelin (A04).
+      const session = await post("/api/realtime/session", {
+        publicKey, agentId, visitorRef: visitorRef(),
+      }) as unknown as SessionPayload;
+      if (!isCurrent()) {
+        finalizeSession(session);
+        return;
+      }
+      sessionRef.current = session;
+      setAgentName(session.agent?.name ?? null);
+
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
-
       const audio = document.createElement("audio");
       audio.autoplay = true;
+      audio.setAttribute("playsinline", "");
+      audio.hidden = true;
+      document.body.appendChild(audio);
       audioRef.current = audio;
-      pc.ontrack = (e) => {
-        audio.srcObject = e.streams[0];
+      pc.ontrack = (event) => {
+        if (isCurrent()) audio.srcObject = event.streams[0];
       };
-
-      pc.addTrack(stream.getTracks()[0]);
+      pc.addTrack(stream.getAudioTracks()[0], stream);
 
       const dc = pc.createDataChannel(DATA_CHANNEL);
       dcRef.current = dc;
-
-      dc.onmessage = (e) => {
-        try {
-          handleEvent(JSON.parse(e.data));
-        } catch {
-          /* trame non-JSON : rien à traiter */
-        }
+      dc.onmessage = (event) => {
+        if (!isCurrent()) return;
+        let parsed: Record<string, unknown>;
+        try { parsed = JSON.parse(event.data); } catch { return; }
+        handleEvent(parsed);
       };
-
+      dc.onerror = () => {
+        if (isCurrent()) failWith("Connexion vocale interrompue. Vous pouvez rappeler.");
+      };
+      dc.onclose = () => {
+        if (isCurrent()) failWith("Connexion vocale interrompue. Vous pouvez rappeler.");
+      };
       dc.onopen = () => {
+        if (!isCurrent()) return;
+        if (attempt.connectTimeout) clearTimeout(attempt.connectTimeout);
+        attempt.connectTimeout = null;
         setStatus("connected");
-        // L'agent parle en premier : un silence à l'ouverture fait
-        // raccrocher. On dicte la phrase d'accueil plutôt que de l'espérer.
         send({
           type: "response.create",
           response: {
             instructions: `Dis exactement, d'un ton chaleureux : « ${session.greeting} » Puis tais-toi et écoute.`,
           },
         });
-      };
 
+        // Défense locale uniquement : ne garantit PAS le budget d'un client
+        // modifié. La supervision prestataire côté serveur reste nécessaire.
+        const maxSeconds = Math.max(1, Math.min(1800, session.limits?.maxSeconds || 1800));
+        attempt.maxDurationTimeout = setTimeout(() => {
+          if (isCurrent()) teardown("duree_max", "ended");
+        }, maxSeconds * 1000);
+        const everyMs = Math.max(1, session.limits?.heartbeatSeconds || 15) * 1000;
+        let pending = false;
+        let failures = 0;
+        heartbeatRef.current = setInterval(async () => {
+          if (!isCurrent() || pending) return;
+          pending = true;
+          try {
+            const json = await post("/api/realtime/heartbeat", {
+              publicKey, conversationId: session.conversationId,
+            }, attempt.controller.signal);
+            if (!isCurrent()) return;
+            failures = 0;
+            setRemainingSeconds(Number(json.remainingSeconds ?? 0));
+            if (json.shouldStop) teardown(String(json.reason ?? "arret"), "ended");
+          } catch {
+            if (isCurrent() && ++failures >= MAX_HEARTBEAT_FAILURES) {
+              failWith("Connexion au serveur perdue. L'appel a été arrêté ; vous pouvez rappeler.");
+            }
+          } finally { pending = false; }
+        }, everyMs);
+      };
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-          failWith("Connexion vocale interrompue.");
+        if (isCurrent() && (pc.connectionState === "failed" || pc.connectionState === "disconnected")) {
+          failWith("Connexion vocale interrompue. Vous pouvez rappeler.");
         }
       };
 
       const offer = await pc.createOffer();
+      if (!isCurrent()) return;
       await pc.setLocalDescription(offer);
-
+      if (!isCurrent()) return;
       const sdpRes = await fetch(CALLS_URL, {
-        method: "POST",
-        body: offer.sdp,
-        headers: {
-          Authorization: `Bearer ${session.clientSecret}`,
-          "Content-Type": "application/sdp",
-        },
+        method: "POST", body: offer.sdp, signal: attempt.controller.signal,
+        headers: { Authorization: `Bearer ${session.clientSecret}`, "Content-Type": "application/sdp" },
       });
-      if (!sdpRes.ok) {
-        throw new Error(`négociation refusée (${sdpRes.status})`);
-      }
-      await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
-
-      setStatus("listening");
-
-      // Compteur : c'est le serveur qui décide quand on raccroche.
-      const everyMs = (session.limits?.heartbeatSeconds ?? 15) * 1000;
-      heartbeatRef.current = setInterval(async () => {
-        const current = sessionRef.current;
-        if (!current) return;
-        try {
-          const json = await post("/api/realtime/heartbeat", {
-            publicKey,
-            conversationId: current.conversationId,
-          });
-          setRemainingSeconds(Number(json.remainingSeconds ?? 0));
-          if (json.shouldStop) teardown(String(json.reason ?? "arret"), "ended");
-        } catch {
-          /* perte réseau passagère : la relève suivante rattrapera */
-        }
-      }, everyMs);
-    } catch (e) {
-      failWith((e as Error)?.message || "Impossible d'établir la liaison vocale.");
+      if (!isCurrent()) return;
+      if (!sdpRes.ok) throw new Error(`Négociation vocale refusée (${sdpRes.status}). Vous pouvez rappeler.`);
+      const sdp = await sdpRes.text();
+      if (!isCurrent()) return;
+      await pc.setRemoteDescription({ type: "answer", sdp });
+    } catch (error) {
+      if (isCurrent()) failWith((error as Error)?.message || "Impossible d'établir la liaison vocale.");
     }
-  }, [agentId, failWith, handleEvent, post, publicKey, send, teardown]);
+  }, [agentId, failWith, finalizeSession, handleEvent, post, publicKey, send, teardown]);
 
   /* ───────────────────────────── Micro ───────────────────────────── */
 
@@ -423,17 +474,18 @@ export function useRealtimeVoice(opts: UseRealtimeVoiceOptions) {
     setMuted(!track.enabled);
   }, []);
 
-  /* Fermeture propre : onglet quitté, composant démonté. */
+  /* Le nettoyage dépend uniquement de l'identité API/tenant, jamais des
+   * callbacks utilisateur ni d'un changement de statut/transcript. */
   useEffect(() => {
-    const onHide = () => {
-      if (sessionRef.current) teardown("page_quittee", "ended");
-    };
+    mountedRef.current = true;
+    const onHide = () => teardown("page_quittee", "ended");
     window.addEventListener("pagehide", onHide);
     return () => {
       window.removeEventListener("pagehide", onHide);
-      onHide();
+      mountedRef.current = false;
+      teardown("page_quittee", "ended");
     };
-  }, [teardown]);
+  }, [teardown, agentId]);
 
   const isLive = status === "connected" || status === "listening" || status === "speaking";
 
